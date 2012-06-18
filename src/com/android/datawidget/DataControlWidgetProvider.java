@@ -24,22 +24,25 @@ import android.appwidget.AppWidgetManager;
 import android.appwidget.AppWidgetProvider;
 import android.bluetooth.BluetoothAdapter;
 import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.ContentObserver;
 import android.net.ConnectivityManager;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.AsyncTask;
+import android.os.Handler;
+import android.os.IPowerManager;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.IWindowManager;
 import android.view.KeyEvent;
 import android.widget.RemoteViews;
-
-import com.android.datawidget.R;
 
 /**
  * Provides control of power-related settings from a widget.
@@ -55,6 +58,7 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 	private static final int BUTTON_APN = 1;
 	private static final int BUTTON_BLUETOOTH = 2;
 	private static final int BUTTON_SLEEP = 3;
+	private static final int BUTTON_BRIGHTNESS = 4;
 
 	// This widget keeps track of two sets of states:
 	// "3-state": STATE_DISABLED, STATE_ENABLED, STATE_INTERMEDIATE
@@ -91,6 +95,19 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 	private static final StateTracker sBluetoothState = new BluetoothStateTracker();
 	private static final StateTracker sApnState = new ApnStateTracker();
 	private static boolean apnIntermediateState = false;
+
+	/**
+	 * Minimum and maximum brightnesses. Don't go to 0 since that makes the
+	 * display unusable
+	 */
+	private static final int MINIMUM_BACKLIGHT = android.os.Power.BRIGHTNESS_DIM + 10;
+	private static final int MAXIMUM_BACKLIGHT = android.os.Power.BRIGHTNESS_ON;
+	private static final int DEFAULT_BACKLIGHT = (int) (android.os.Power.BRIGHTNESS_ON * 0.4f);
+	/** Minimum brightness at which the indicator is shown at half-full and ON */
+	private static final int HALF_BRIGHTNESS_THRESHOLD = (int) (0.3 * MAXIMUM_BACKLIGHT);
+	/** Minimum brightness at which the indicator is shown at full */
+	private static final int FULL_BRIGHTNESS_THRESHOLD = (int) (0.8 * MAXIMUM_BACKLIGHT);
+	private static SettingsObserver sSettingsObserver;
 
 	/**
 	 * The state machine for a setting's toggling, tracking reality versus the
@@ -493,7 +510,7 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 			if (mConnService != null) {
 				int state = mConnService.getMobileDataEnabled() ? STATE_ENABLED
 						: STATE_DISABLED;
-				Log.d(TAG, "State: "+state);
+				Log.d(TAG, "State: " + state);
 				return state;
 			}
 			return STATE_UNKNOWN;
@@ -504,7 +521,7 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 			// Note: the broadcast location providers changed intent
 			// doesn't include an extras bundles saying what the new value is.
 			int state = getActualState(context);
-			Log.d(TAG, "onActualStateChange: "+state);
+			Log.d(TAG, "onActualStateChange: " + state);
 			setCurrentState(context, state);
 		}
 
@@ -530,7 +547,7 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 
 				@Override
 				protected void onPostExecute(Boolean result) {
-					Log.d(TAG, "onPostExecute: "+result);
+					Log.d(TAG, "onPostExecute: " + result);
 					if (apnIntermediateState)
 						setCurrentState(context, STATE_TURNING_ON);
 					else
@@ -539,6 +556,14 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 					updateWidget(context);
 				}
 			}.execute();
+		}
+	}
+
+	private static void checkObserver(Context context) {
+		if (sSettingsObserver == null) {
+			sSettingsObserver = new SettingsObserver(new Handler(),
+					context.getApplicationContext());
+			sSettingsObserver.startObserving();
 		}
 	}
 
@@ -556,19 +581,24 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 	@Override
 	public void onEnabled(Context context) {
 		PackageManager pm = context.getPackageManager();
-		pm.setComponentEnabledSetting(new ComponentName("com.android.datawidget",
-				".DataControlWidgetProvider"),
+		pm.setComponentEnabledSetting(new ComponentName(
+				"com.android.datawidget", ".DataControlWidgetProvider"),
 				PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
 				PackageManager.DONT_KILL_APP);
+		checkObserver(context);
 	}
 
 	@Override
 	public void onDisabled(Context context) {
 		PackageManager pm = context.getPackageManager();
-		pm.setComponentEnabledSetting(new ComponentName("com.android.datawidget",
-				".DataControlWidgetProvider"),
+		pm.setComponentEnabledSetting(new ComponentName(
+				"com.android.datawidget", ".DataControlWidgetProvider"),
 				PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
 				PackageManager.DONT_KILL_APP);
+		if (sSettingsObserver != null) {
+			sSettingsObserver.stopObserving();
+			sSettingsObserver = null;
+		}
 	}
 
 	/**
@@ -587,6 +617,8 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 				getLaunchPendingIntent(context, BUTTON_SLEEP));
 		views.setOnClickPendingIntent(R.id.btn_data_settings,
 				getSettingsIntent(context));
+		views.setOnClickPendingIntent(R.id.btn_brightness,
+				getLaunchPendingIntent(context, BUTTON_BRIGHTNESS));
 
 		updateButtons(views, context);
 		return views;
@@ -603,6 +635,7 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 		// all
 		final AppWidgetManager gm = AppWidgetManager.getInstance(context);
 		gm.updateAppWidget(THIS_APPWIDGET, views);
+		checkObserver(context);
 	}
 
 	/**
@@ -616,6 +649,34 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 		sWifiState.setImageViewResources(context, views);
 		sBluetoothState.setImageViewResources(context, views);
 		sApnState.setImageViewResources(context, views);
+
+		if (getBrightnessMode(context)) {
+			views.setImageViewResource(R.id.img_brightness,
+					R.drawable.ic_appwidget_settings_brightness_auto_holo);
+			views.setImageViewResource(R.id.ind_brightness,
+					R.drawable.appwidget_settings_ind_on_r_holo);
+		} else {
+			final int brightness = getBrightness(context);
+			// Set the icon
+			if (brightness > FULL_BRIGHTNESS_THRESHOLD) {
+				views.setImageViewResource(R.id.img_brightness,
+						R.drawable.ic_appwidget_settings_brightness_full_holo);
+			} else if (brightness > HALF_BRIGHTNESS_THRESHOLD) {
+				views.setImageViewResource(R.id.img_brightness,
+						R.drawable.ic_appwidget_settings_brightness_half_holo);
+			} else {
+				views.setImageViewResource(R.id.img_brightness,
+						R.drawable.ic_appwidget_settings_brightness_off_holo);
+			}
+			// Set the ON state
+			if (brightness > HALF_BRIGHTNESS_THRESHOLD) {
+				views.setImageViewResource(R.id.ind_brightness,
+						R.drawable.appwidget_settings_ind_on_r_holo);
+			} else {
+				views.setImageViewResource(R.id.ind_brightness,
+						R.drawable.appwidget_settings_ind_off_r_holo);
+			}
+		}
 	}
 
 	/**
@@ -694,6 +755,8 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 				} catch (RemoteException e) {
 					Log.d(TAG, "SendKeyEvent exception:" + e.getMessage());
 				}
+			} else if (buttonId == BUTTON_BRIGHTNESS) {
+				toggleBrightness(context);
 			}
 		} else {
 			// Don't fall-through to updating the widget. The Intent
@@ -704,6 +767,142 @@ public class DataControlWidgetProvider extends AppWidgetProvider {
 
 		// State changes fall through
 		updateWidget(context);
+	}
+
+	/**
+	 * Gets brightness level.
+	 * 
+	 * @param context
+	 * @return brightness level between 0 and 255.
+	 */
+	private static int getBrightness(Context context) {
+		try {
+			IPowerManager power = IPowerManager.Stub.asInterface(ServiceManager
+					.getService("power"));
+			if (power != null) {
+				int brightness = Settings.System.getInt(
+						context.getContentResolver(),
+						Settings.System.SCREEN_BRIGHTNESS);
+				return brightness;
+			}
+		} catch (Exception e) {
+		}
+		return 0;
+	}
+
+	/**
+	 * Gets state of brightness mode.
+	 * 
+	 * @param context
+	 * @return true if auto brightness is on.
+	 */
+	private static boolean getBrightnessMode(Context context) {
+		try {
+			IPowerManager power = IPowerManager.Stub.asInterface(ServiceManager
+					.getService("power"));
+			if (power != null) {
+				int brightnessMode = Settings.System.getInt(
+						context.getContentResolver(),
+						Settings.System.SCREEN_BRIGHTNESS_MODE);
+				return brightnessMode == Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC;
+			}
+		} catch (Exception e) {
+			Log.d(TAG, "getBrightnessMode: " + e);
+		}
+		return false;
+	}
+
+	/**
+	 * Increases or decreases the brightness.
+	 * 
+	 * @param context
+	 */
+	private void toggleBrightness(Context context) {
+		try {
+			IPowerManager power = IPowerManager.Stub.asInterface(ServiceManager
+					.getService("power"));
+			if (power != null) {
+				ContentResolver cr = context.getContentResolver();
+				int brightness = Settings.System.getInt(cr,
+						Settings.System.SCREEN_BRIGHTNESS);
+				int brightnessMode = Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL;
+				// Only get brightness setting if available
+				if (context
+						.getResources()
+						.getBoolean(
+								com.android.internal.R.bool.config_automatic_brightness_available)) {
+					brightnessMode = Settings.System.getInt(cr,
+							Settings.System.SCREEN_BRIGHTNESS_MODE);
+				}
+
+				// Rotate AUTO -> MINIMUM -> DEFAULT -> MAXIMUM
+				// Technically, not a toggle...
+				if (brightnessMode == Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC) {
+					brightness = MINIMUM_BACKLIGHT;
+					brightnessMode = Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL;
+				} else if (brightness < DEFAULT_BACKLIGHT) {
+					brightness = DEFAULT_BACKLIGHT;
+				} else if (brightness < MAXIMUM_BACKLIGHT) {
+					brightness = MAXIMUM_BACKLIGHT;
+				} else {
+					brightnessMode = Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC;
+					brightness = MINIMUM_BACKLIGHT;
+				}
+
+				if (context
+						.getResources()
+						.getBoolean(
+								com.android.internal.R.bool.config_automatic_brightness_available)) {
+					// Set screen brightness mode (automatic or manual)
+					Settings.System.putInt(context.getContentResolver(),
+							Settings.System.SCREEN_BRIGHTNESS_MODE,
+							brightnessMode);
+				} else {
+					// Make sure we set the brightness if automatic mode isn't
+					// available
+					brightnessMode = Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL;
+				}
+				if (brightnessMode == Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL) {
+					power.setBacklightBrightness(brightness);
+					Settings.System.putInt(cr,
+							Settings.System.SCREEN_BRIGHTNESS, brightness);
+				}
+			}
+		} catch (RemoteException e) {
+			Log.d(TAG, "toggleBrightness: " + e);
+		} catch (Settings.SettingNotFoundException e) {
+			Log.d(TAG, "toggleBrightness: " + e);
+		}
+	}
+
+	/** Observer to watch for changes to the BRIGHTNESS setting */
+	private static class SettingsObserver extends ContentObserver {
+
+		private Context mContext;
+
+		SettingsObserver(Handler handler, Context context) {
+			super(handler);
+			mContext = context;
+		}
+
+		void startObserving() {
+			ContentResolver resolver = mContext.getContentResolver();
+			// Listen to brightness and brightness mode
+			resolver.registerContentObserver(Settings.System
+					.getUriFor(Settings.System.SCREEN_BRIGHTNESS), false, this);
+			resolver.registerContentObserver(Settings.System
+					.getUriFor(Settings.System.SCREEN_BRIGHTNESS_MODE), false,
+					this);
+		}
+
+		void stopObserving() {
+			mContext.getContentResolver().unregisterContentObserver(this);
+		}
+
+		@Override
+		public void onChange(boolean selfChange) {
+			updateWidget(mContext);
+		}
 	}
 
 }
